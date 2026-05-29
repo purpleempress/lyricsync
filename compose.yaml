@@ -1,0 +1,33 @@
+# LyricSync API service.
+#
+# First create credentials.json once (host):
+#   python scripts/librespot_login.py
+# Then:
+#   docker compose up -d --build
+# Point the Lucid extension's `lucid-lyrics:sync-api-url` at http://<host>:8000.
+services:
+  lyricsync:
+    build: .
+    image: lyricsync:latest
+    container_name: lyricsync
+    ports:
+      - "8000:8000"
+    environment:
+      # Comma-separated allowed origins; "*" is fine for a personal LAN service.
+      LYRICSYNC_CORS: "*"
+    volumes:
+      # Your Spotify credentials. NOT read-only: librespot rewrites this file to
+      # refresh its stored auth blob. Generate it with scripts/librespot_login.py.
+      - ./credentials.json:/app/credentials.json
+      # Model weights + per-track sync cache; persists across restarts/rebuilds.
+      - lyricsync-cache:/app/.cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  lyricsync-cache:

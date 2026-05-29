@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.ttml
+*.json
+*.egg-info/
+.cache/
+credentials.json
+# The Lucid fork is its own repo (purpleempress/lucid-lyrics), not vendored here.
+lucid-lyrics/

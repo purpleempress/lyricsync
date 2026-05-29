@@ -1,0 +1,15 @@
+# The Lucid fork is the client; the image only needs the API.
+lucid-lyrics/
+.venv/
+.cache/
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+tests/
+# Never bake the Spotify credentials into the image — mounted at runtime.
+credentials.json
+# Sample media / generated artifacts
+*.opus
+*.ttml
+*.synced.json
