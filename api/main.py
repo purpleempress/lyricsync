@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -35,7 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from lyricsync import ttml_in
-from lyricsync.align import align
+from lyricsync.align import _stage, _tlog, align
 from lyricsync.lucid_json import to_lucid
 from lyricsync.sources import TrackRef, source_audio
 from lyricsync.ttml_out import to_ttml
@@ -104,6 +105,7 @@ class SyncRequest(BaseModel):
 
 def _run_sync(job_id: str, req: SyncRequest, key: str) -> None:
     _set(job_id, status="running")
+    t_job = time.perf_counter()
     try:
         if req.lyrics:
             parsed = ttml_in.from_lines(req.lyrics, lang=req.language or "en")
@@ -114,11 +116,15 @@ def _run_sync(job_id: str, req: SyncRequest, key: str) -> None:
 
         with tempfile.TemporaryDirectory() as tmp:
             track = TrackRef(req.spotifyId, req.title, req.artist, req.duration)
-            audio_path, src = source_audio(track, tmp)
+            with _stage("source_audio"):   # librespot pull (network + decrypt)
+                audio_path, src = source_audio(track, tmp)
             aligned = align(audio_path, parsed, demucs=req.demucs,
                             model_name=req.model, language=req.language)
-        result = to_lucid(aligned, id=req.spotifyId, word_level=req.wordLevel)
+        with _stage("to_lucid"):
+            result = to_lucid(aligned, id=req.spotifyId, word_level=req.wordLevel)
         _cache_store(key, result)
+        _tlog(f"{'JOB TOTAL':<13} {time.perf_counter() - t_job:7.2f}s "
+              f"(source={src})")
         _set(job_id, status="done", result=result, source=src)
     except Exception as exc:
         _set(job_id, status="error", error=f"{type(exc).__name__}: {exc}")

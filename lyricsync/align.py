@@ -8,13 +8,40 @@ the original line/token structure.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
 from .model import AlignedLyrics, Line, Word
 from .ttml_in import ParsedLyrics
+
+
+# --------------------------------------------------------------------------- #
+# Timing instrumentation (debug)
+# --------------------------------------------------------------------------- #
+# Stage timings print to stderr (so they show in `docker compose logs`) when
+# LYRICSYNC_TIMING is set. Unset -> zero overhead, no output. Remove with
+# `git apply -R` once the slow stage is identified.
+_TIMING = os.environ.get("LYRICSYNC_TIMING", "1") not in ("", "0", "false")
+
+
+def _tlog(msg: str) -> None:
+    if _TIMING:
+        print(f"[timing] {msg}", file=sys.stderr, flush=True)
+
+
+@contextmanager
+def _stage(name: str):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        _tlog(f"{name:<13} {time.perf_counter() - t0:7.2f}s")
 
 
 # --------------------------------------------------------------------------- #
@@ -164,44 +191,60 @@ def align(
     model_name: str = "small",
     language: str | None = None,
 ) -> AlignedLyrics:
-    dur = probe_duration(audio_path)
+    t_start = time.perf_counter()
+    with _stage("probe"):
+        dur = probe_duration(audio_path)
     lang = language or parsed.lang or "en"
 
     with tempfile.TemporaryDirectory() as tmp:
         wav = str(Path(tmp) / "audio.wav")
-        _decode_wav(audio_path, wav)
-        align_audio = _isolate_vocals(wav, tmp) if demucs else wav
+        with _stage("decode"):
+            _decode_wav(audio_path, wav)
+        if demucs:
+            with _stage("demucs"):
+                align_audio = _isolate_vocals(wav, tmp)
+        else:
+            align_audio = wav
+            _tlog("demucs        skipped")
 
-        model = _load_model(model_name)
-        result = model.align(align_audio, parsed.alignment_text, language=lang)
+        with _stage("model_load"):   # ~0s on a warm cache; large on first job
+            model = _load_model(model_name)
+        with _stage("align"):
+            result = model.align(align_audio, parsed.alignment_text,
+                                 language=lang)
 
-    # Flatten aligned words.
-    if hasattr(result, "all_words"):
-        words = result.all_words()
-    else:
-        words = [w for seg in result.segments for w in seg.words]
-    aligned = [(w.word, float(w.start), float(w.end)) for w in words]
+    with _stage("map+rebuild"):
+        # Flatten aligned words.
+        if hasattr(result, "all_words"):
+            words = result.all_words()
+        else:
+            words = [w for seg in result.segments for w in seg.words]
+        aligned = [(w.word, float(w.start), float(w.end)) for w in words]
 
-    # Map onto our canonical lexical tokens.
-    tokens = [w for ln in parsed.lines if not ln.is_nonlexical for w in ln.words]
-    times = _fill_gaps(_map_times(tokens, aligned), dur)
+        # Map onto our canonical lexical tokens.
+        tokens = [w for ln in parsed.lines if not ln.is_nonlexical
+                  for w in ln.words]
+        times = _fill_gaps(_map_times(tokens, aligned), dur)
 
-    # Rebuild lines.
-    out = AlignedLyrics(dur=dur, lang=lang, songwriters=parsed.songwriters)
-    cursor = 0
-    for n, pl in enumerate(parsed.lines, start=1):
-        line = Line(key=f"L{n}", agent="v1", text=pl.text,
-                    is_nonlexical=pl.is_nonlexical)
-        if not pl.is_nonlexical:
-            for tok in pl.words:
-                b, e = times[cursor]
-                line.words.append(Word(text=tok, begin=b, end=e))
-                cursor += 1
-            line.begin = line.words[0].begin
-            line.end = line.words[-1].end
-        out.lines.append(line)
+        # Rebuild lines.
+        out = AlignedLyrics(dur=dur, lang=lang, songwriters=parsed.songwriters)
+        cursor = 0
+        for n, pl in enumerate(parsed.lines, start=1):
+            line = Line(key=f"L{n}", agent="v1", text=pl.text,
+                        is_nonlexical=pl.is_nonlexical)
+            if not pl.is_nonlexical:
+                for tok in pl.words:
+                    b, e = times[cursor]
+                    line.words.append(Word(text=tok, begin=b, end=e))
+                    cursor += 1
+                line.begin = line.words[0].begin
+                line.end = line.words[-1].end
+            out.lines.append(line)
 
-    _time_nonlexical(out, dur)
+        _time_nonlexical(out, dur)
+
+    _tlog(f"{'TOTAL align':<13} {time.perf_counter() - t_start:7.2f}s "
+          f"(demucs={'on' if demucs else 'off'}, model={model_name})")
     return out
 
 
