@@ -63,6 +63,22 @@ def _load_model(model_name: str):
         model_name, device="cpu", compute_type="int8")
 
 
+@lru_cache(maxsize=1)
+def _load_demucs(name: str = "htdemucs"):
+    """Load a Demucs separation model, cached for the process.
+
+    Same rationale as ``_load_model``: ``get_model`` re-reads the weights from
+    disk every call, so loading it per job wastes seconds on every demucs-on
+    request. Cache it once. ``.cpu().eval()`` is idempotent, so it's safe to
+    apply at load time. Single worker -> no cache race.
+    """
+    from demucs.pretrained import get_model
+
+    model = get_model(name)
+    model.cpu().eval()
+    return model
+
+
 # --------------------------------------------------------------------------- #
 # Audio prep
 # --------------------------------------------------------------------------- #
@@ -95,10 +111,8 @@ def _isolate_vocals(wav_path: str, workdir: str) -> str:
     import torch
     from demucs.apply import apply_model
     from demucs.audio import AudioFile
-    from demucs.pretrained import get_model
 
-    model = get_model("htdemucs")
-    model.cpu().eval()
+    model = _load_demucs("htdemucs")
 
     wav = AudioFile(wav_path).read(
         streams=0, samplerate=model.samplerate, channels=model.audio_channels)
@@ -201,6 +215,8 @@ def align(
         with _stage("decode"):
             _decode_wav(audio_path, wav)
         if demucs:
+            with _stage("demucs_load"):  # ~0s warm; htdemucs weights on first job
+                _load_demucs("htdemucs")
             with _stage("demucs"):
                 align_audio = _isolate_vocals(wav, tmp)
         else:
