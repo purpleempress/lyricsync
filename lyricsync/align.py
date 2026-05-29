@@ -10,10 +10,30 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 
 from .model import AlignedLyrics, Line, Word
 from .ttml_in import ParsedLyrics
+
+
+# --------------------------------------------------------------------------- #
+# Model loading
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=2)
+def _load_model(model_name: str):
+    """Load a faster-whisper (CTranslate2) model, cached for the process.
+
+    CTranslate2 with ``compute_type="int8"`` is markedly faster than the
+    openai-whisper/torch backend on CPU, and for *forced alignment* (the words
+    are already known) the int8 quantization costs basically no accuracy. The
+    cache means a long-lived service loads weights once rather than per job;
+    safe here because the API runs alignment single-threaded (one worker).
+    """
+    import stable_whisper
+
+    return stable_whisper.load_faster_whisper(
+        model_name, device="cpu", compute_type="int8")
 
 
 # --------------------------------------------------------------------------- #
@@ -144,8 +164,6 @@ def align(
     model_name: str = "small",
     language: str | None = None,
 ) -> AlignedLyrics:
-    import stable_whisper
-
     dur = probe_duration(audio_path)
     lang = language or parsed.lang or "en"
 
@@ -154,7 +172,7 @@ def align(
         _decode_wav(audio_path, wav)
         align_audio = _isolate_vocals(wav, tmp) if demucs else wav
 
-        model = stable_whisper.load_model(model_name)
+        model = _load_model(model_name)
         result = model.align(align_audio, parsed.alignment_text, language=lang)
 
     # Flatten aligned words.

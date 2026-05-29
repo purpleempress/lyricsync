@@ -5,6 +5,7 @@ description = "Forced-align song audio to known lyrics and emit word-level synce
 requires-python = ">=3.10"
 dependencies = [
     "stable-ts>=2.17.0",
+    "faster-whisper>=1.0",
     "torch>=2.0",
     "torchaudio>=2.0",
     "demucs>=4.0",
