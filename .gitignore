@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 *.ttml
 *.json
+*.opus
 *.egg-info/
 .cache/
 credentials.json

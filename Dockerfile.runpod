@@ -33,8 +33,11 @@ RUN pip install "." runpod
 
 COPY runpod_handler.py ./
 
-# Bake weights into the image so a cold worker doesn't download them.
+# Bake weights into the image so a cold worker doesn't download them. The last
+# line warms Silero VAD's torch.hub cache (vad=True is the default for music) so
+# a cold worker never reaches out to GitHub for it on the first aligned request.
 RUN python3 -c "from demucs.pretrained import get_model; get_model('htdemucs'); \
-import stable_whisper; stable_whisper.load_faster_whisper('small', device='cpu', compute_type='int8')"
+import stable_whisper; stable_whisper.load_faster_whisper('small', device='cpu', compute_type='int8'); \
+from stable_whisper.stabilization.silero_vad import load_silero_vad_model; load_silero_vad_model()"
 
 CMD ["python3", "-u", "runpod_handler.py"]

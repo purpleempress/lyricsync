@@ -33,7 +33,7 @@ _IDLE_SECS = int(os.environ.get("LYRICSYNC_GPU_IDLE_SECS", "300"))
 
 
 def _download_models() -> None:
-    """Bake htdemucs + the default whisper weights into the image layer."""
+    """Bake htdemucs + the default whisper weights + Silero VAD into the layer."""
     from demucs.pretrained import get_model
 
     get_model("htdemucs")
@@ -41,6 +41,14 @@ def _download_models() -> None:
 
     stable_whisper.load_faster_whisper(
         _PREFETCH_WHISPER, device="cpu", compute_type="int8")
+
+    # vad=True (default for music) loads Silero via torch.hub on first use;
+    # bake it into the image layer so a cold container never downloads it. Call
+    # stable-ts directly, not lyricsync._load_silero_vad: this build step runs
+    # before add_local_python_source, so `lyricsync` isn't importable here yet.
+    from stable_whisper.stabilization.silero_vad import load_silero_vad_model
+
+    load_silero_vad_model()
 
 
 # Base on NVIDIA's CUDA *runtime* image rather than debian_slim: it ships
@@ -111,10 +119,11 @@ class Aligner:
         ``lyricsync.align``; the snapshot freezes that cache (and the VRAM
         behind it), and ``_compute_alignment`` later hits it for free.
         """
-        from lyricsync.align import _load_demucs, _load_model
+        from lyricsync.align import _load_demucs, _load_model, _load_silero_vad
 
         _load_demucs("htdemucs")                      # torch weights (CPU-resident)
         _load_model(_PREFETCH_WHISPER, device="cuda")  # CTranslate2 weights (VRAM)
+        _load_silero_vad()                            # Silero VAD (frozen in snapshot)
 
     @modal.method()
     def transcribe_align(

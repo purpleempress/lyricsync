@@ -84,6 +84,28 @@ def _load_demucs(name: str = "htdemucs"):
     return model
 
 
+@lru_cache(maxsize=1)
+def _load_silero_vad():
+    """Pre-load stable-ts's Silero VAD so ``align(vad=True)`` doesn't stall.
+
+    stable-ts loads Silero lazily via ``torch.hub`` on the first ``vad=True``
+    alignment, which both downloads the snakers4/silero-vad repo (a cold-start
+    cost) and re-fetches it per process. Calling this warms stable-ts's own
+    process-level ``cached_model_instances`` cache so later alignments reuse it
+    -- same rationale as ``_load_model`` / ``_load_demucs``. At image-build time
+    it also populates the ``torch.hub`` cache into the baked layer, so a cold
+    GPU worker never downloads it. Import is lazy and the path is internal to
+    stable-ts, so failure here must not be fatal: VAD would simply lazy-load.
+    """
+    try:
+        from stable_whisper.stabilization.silero_vad import load_silero_vad_model
+
+        return load_silero_vad_model()
+    except Exception as exc:  # pragma: no cover - warm-only optimization
+        _tlog(f"silero_vad    warm skipped ({type(exc).__name__})")
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Audio prep
 # --------------------------------------------------------------------------- #
@@ -165,12 +187,16 @@ def _isolate_vocals(wav_path: str, workdir: str, device: str = "cpu",
 # Returns plain JSON-serializable data so it can cross the Modal boundary.
 # --------------------------------------------------------------------------- #
 def _align_opts(fast_mode: bool | None,
-                nonspeech_skip: float | None) -> dict:
+                nonspeech_skip: float | None,
+                vad: bool | None) -> dict:
     """Resolve stable-ts ``align()`` speed knobs, env overriding the defaults.
 
-    Explicit args win; otherwise ``LYRICSYNC_FAST_MODE`` (truthy) and
-    ``LYRICSYNC_NONSPEECH_SKIP`` (seconds, or "none" to disable skipping) apply.
-    Defaults match stable-ts: ``fast_mode=False``, ``nonspeech_skip=5.0``.
+    Explicit args win; otherwise ``LYRICSYNC_FAST_MODE`` (truthy),
+    ``LYRICSYNC_NONSPEECH_SKIP`` (seconds, or "none" to disable skipping) and
+    ``LYRICSYNC_VAD`` (truthy, or "0"/"false" to disable) apply. Defaults match
+    stable-ts except ``vad``: ``fast_mode=False``, ``nonspeech_skip=5.0``, and
+    ``vad=True`` -- on by default since we align music, where Silero VAD on the
+    (Demucs-isolated) vocal stem keeps word timings off instrumental rests.
     """
     if fast_mode is None:
         fast_mode = os.environ.get("LYRICSYNC_FAST_MODE", "") not in ("", "0", "false")
@@ -179,7 +205,9 @@ def _align_opts(fast_mode: bool | None,
         nonspeech_skip = (5.0 if ns is None
                           else None if ns.strip().lower() in ("none", "")
                           else float(ns))
-    return {"fast_mode": fast_mode, "nonspeech_skip": nonspeech_skip}
+    if vad is None:
+        vad = os.environ.get("LYRICSYNC_VAD", "1") not in ("0", "false")
+    return {"fast_mode": fast_mode, "nonspeech_skip": nonspeech_skip, "vad": vad}
 
 
 def _demucs_opts(shifts: int | None, overlap: float | None) -> dict:
@@ -208,6 +236,7 @@ def _compute_alignment(
     device: str = "cpu",
     fast_mode: bool | None = None,
     nonspeech_skip: float | None = None,
+    vad: bool | None = None,
     demucs_shifts: int | None = None,
     demucs_overlap: float | None = None,
 ) -> tuple[float, list[tuple[str, float, float]]]:
@@ -216,11 +245,11 @@ def _compute_alignment(
     Returns ``(duration_seconds, [(word, begin, end), ...])`` -- the raw
     stable-ts word timings, before they're mapped back onto the lyric
     structure (that mapping is cheap and stays on the caller). The ``fast_mode``
-    / ``nonspeech_skip`` (stable-ts) and ``demucs_shifts`` / ``demucs_overlap``
-    (Demucs) knobs fall back to env when left None (see ``_align_opts`` /
-    ``_demucs_opts``).
+    / ``nonspeech_skip`` / ``vad`` (stable-ts) and ``demucs_shifts`` /
+    ``demucs_overlap`` (Demucs) knobs fall back to env when left None (see
+    ``_align_opts`` / ``_demucs_opts``).
     """
-    align_opts = _align_opts(fast_mode, nonspeech_skip)
+    align_opts = _align_opts(fast_mode, nonspeech_skip, vad)
     dmx_opts = _demucs_opts(demucs_shifts, demucs_overlap)
     with _stage("probe"):
         dur = probe_duration(audio_path)

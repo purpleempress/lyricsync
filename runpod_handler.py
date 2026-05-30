@@ -20,14 +20,16 @@ import tempfile
 
 import runpod
 
-from lyricsync.align import _compute_alignment, _load_demucs, _load_model
+from lyricsync.align import (
+    _compute_alignment, _load_demucs, _load_model, _load_silero_vad)
 
-# Warm both models at import so FlashBoot-reused workers skip the load entirely.
+# Warm the models at import so FlashBoot-reused workers skip the load entirely.
 # A serverless worker owns its GPU for its whole life, so loading whisper onto
 # CUDA here is fine. `model_name` other than the default still loads on demand.
 _PREFETCH_WHISPER = "small"
 _load_demucs("htdemucs")                       # torch weights (CPU-resident)
 _load_model(_PREFETCH_WHISPER, device="cuda")  # CTranslate2 weights (VRAM)
+_load_silero_vad()                             # Silero VAD (vad=True default)
 
 
 def handler(job: dict) -> dict:
