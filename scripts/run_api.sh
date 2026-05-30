@@ -3,6 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Local config/secrets (LYRICSYNC_BACKEND, RUNPOD_*, fast-mode knobs, ...) if present.
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+
 AUTH="$PWD/credentials.json"
 pkill -f "uvicorn api.main:app" 2>/dev/null || true
 sleep 1

@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import time
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -62,6 +64,18 @@ _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 def _set(job_id: str, **kw) -> None:
     _jobs[job_id] = kw
+
+
+def _fail(job_id: str, exc: Exception) -> None:
+    """Record the error on the job *and* print the traceback to stderr.
+
+    Jobs run in a background thread, so a bare ``except`` that only stashes the
+    message on the job dict leaves ``docker compose logs`` silent. Print it too.
+    """
+    print(f"[error] job {job_id}: {type(exc).__name__}: {exc}",
+          file=sys.stderr, flush=True)
+    traceback.print_exc()
+    _set(job_id, status="error", error=f"{type(exc).__name__}: {exc}")
 
 
 def _sync_key(req: "SyncRequest") -> str:
@@ -127,7 +141,7 @@ def _run_sync(job_id: str, req: SyncRequest, key: str) -> None:
               f"(source={src})")
         _set(job_id, status="done", result=result, source=src)
     except Exception as exc:
-        _set(job_id, status="error", error=f"{type(exc).__name__}: {exc}")
+        _fail(job_id, exc)
     finally:
         if _inflight.get(key) == job_id:
             _inflight.pop(key, None)
@@ -181,7 +195,7 @@ def _run_align(job_id: str, audio_bytes: bytes, suffix: str, lyrics: str,
             "lucidJson": to_lucid(aligned, id="", word_level=word_level),
         })
     except Exception as exc:
-        _set(job_id, status="error", error=f"{type(exc).__name__}: {exc}")
+        _fail(job_id, exc)
 
 
 @app.post("/align")

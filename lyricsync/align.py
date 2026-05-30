@@ -47,20 +47,25 @@ def _stage(name: str):
 # --------------------------------------------------------------------------- #
 # Model loading
 # --------------------------------------------------------------------------- #
-@lru_cache(maxsize=2)
-def _load_model(model_name: str):
+@lru_cache(maxsize=4)
+def _load_model(model_name: str, device: str = "cpu",
+                compute_type: str | None = None):
     """Load a faster-whisper (CTranslate2) model, cached for the process.
 
-    CTranslate2 with ``compute_type="int8"`` is markedly faster than the
-    openai-whisper/torch backend on CPU, and for *forced alignment* (the words
-    are already known) the int8 quantization costs basically no accuracy. The
-    cache means a long-lived service loads weights once rather than per job;
-    safe here because the API runs alignment single-threaded (one worker).
+    On CPU, ``compute_type="int8"`` is markedly faster than the
+    openai-whisper/torch backend, and for *forced alignment* (the words are
+    already known) int8 quantization costs basically no accuracy. On GPU
+    (``device="cuda"``, the Modal path) ``float16`` is both faster and well
+    within VRAM. The cache means a long-lived service / warm Modal container
+    loads weights once rather than per job; keyed on (model, device,
+    compute_type) so the CPU and GPU variants don't collide.
     """
     import stable_whisper
 
+    if compute_type is None:
+        compute_type = "float16" if device == "cuda" else "int8"
     return stable_whisper.load_faster_whisper(
-        model_name, device="cpu", compute_type="int8")
+        model_name, device=device, compute_type=compute_type)
 
 
 @lru_cache(maxsize=1)
@@ -99,13 +104,37 @@ def _decode_wav(audio_path: str, dst: str) -> None:
     )
 
 
-def _isolate_vocals(wav_path: str, workdir: str) -> str:
+def _encode_align_audio(audio_path: str) -> bytes:
+    """16 kHz mono Opus of the track, for shipping to a remote worker.
+
+    The pipeline decodes to 16 kHz mono before Demucs regardless (see
+    ``_decode_wav`` / ``_isolate_vocals``), so this is lossless versus what the
+    worker would do anyway -- but it shrinks a multi-MB master to ~1-2 MB, well
+    under RunPod's 20 MB request-body cap that a base64'd full track blows past.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        out = str(Path(tmp) / "align.opus")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", audio_path, "-ac", "1", "-ar", "16000",
+             "-vn", "-c:a", "libopus", "-b:a", "48k", out],
+            capture_output=True, check=True,
+        )
+        return Path(out).read_bytes()
+
+
+def _isolate_vocals(wav_path: str, workdir: str, device: str = "cpu",
+                    *, shifts: int = 1, overlap: float = 0.25) -> str:
     """Isolate the vocal stem with Demucs; return the written WAV path.
 
     Driven through Demucs's Python API and saved via ``soundfile`` rather than
     the CLI: torchaudio 2.x delegates saving to ``torchcodec`` (often absent),
     so the ``demucs`` CLI's save step fails. In-process also avoids a second
-    model load.
+    model load. ``apply_model`` moves the (cpu-loaded) weights onto ``device``
+    itself, so ``device="cuda"`` on the Modal path needs nothing else here.
+
+    ``shifts`` / ``overlap`` are demucs speed/quality knobs: ``overlap`` is the
+    fraction each chunk shares with its neighbour (lower = less compute),
+    ``shifts`` averages N randomly-offset passes (0 = single pass).
     """
     import soundfile as sf
     import torch
@@ -120,13 +149,192 @@ def _isolate_vocals(wav_path: str, workdir: str) -> str:
     wav = (wav - ref.mean()) / (ref.std() + 1e-8)
 
     with torch.no_grad():
-        sources = apply_model(model, wav[None], device="cpu", progress=False)[0]
+        sources = apply_model(model, wav[None], device=device, progress=False,
+                              shifts=shifts, overlap=overlap)[0]
     sources = sources * ref.std() + ref.mean()
     vocals = sources[model.sources.index("vocals")]
 
     out = str(Path(workdir) / "vocals.wav")
     sf.write(out, vocals.T.numpy(), model.samplerate)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Compute stage: decode -> (demucs) -> forced align.  Runs either locally on
+# CPU or, when offloaded, inside the Modal GPU container (see ``modal_app.py``).
+# Returns plain JSON-serializable data so it can cross the Modal boundary.
+# --------------------------------------------------------------------------- #
+def _align_opts(fast_mode: bool | None,
+                nonspeech_skip: float | None) -> dict:
+    """Resolve stable-ts ``align()`` speed knobs, env overriding the defaults.
+
+    Explicit args win; otherwise ``LYRICSYNC_FAST_MODE`` (truthy) and
+    ``LYRICSYNC_NONSPEECH_SKIP`` (seconds, or "none" to disable skipping) apply.
+    Defaults match stable-ts: ``fast_mode=False``, ``nonspeech_skip=5.0``.
+    """
+    if fast_mode is None:
+        fast_mode = os.environ.get("LYRICSYNC_FAST_MODE", "") not in ("", "0", "false")
+    if nonspeech_skip is None:
+        ns = os.environ.get("LYRICSYNC_NONSPEECH_SKIP")
+        nonspeech_skip = (5.0 if ns is None
+                          else None if ns.strip().lower() in ("none", "")
+                          else float(ns))
+    return {"fast_mode": fast_mode, "nonspeech_skip": nonspeech_skip}
+
+
+def _demucs_opts(shifts: int | None, overlap: float | None) -> dict:
+    """Resolve Demucs speed knobs, env overriding the defaults.
+
+    Explicit args win; otherwise ``LYRICSYNC_DEMUCS_SHIFTS`` /
+    ``LYRICSYNC_DEMUCS_OVERLAP`` apply. Defaults match demucs: ``shifts=1``,
+    ``overlap=0.25``.
+    """
+    if shifts is None:
+        s = os.environ.get("LYRICSYNC_DEMUCS_SHIFTS")
+        shifts = 1 if s is None else int(s)
+    if overlap is None:
+        o = os.environ.get("LYRICSYNC_DEMUCS_OVERLAP")
+        overlap = 0.25 if o is None else float(o)
+    return {"shifts": shifts, "overlap": overlap}
+
+
+def _compute_alignment(
+    audio_path: str,
+    alignment_text: str,
+    *,
+    demucs: bool = True,
+    model_name: str = "small",
+    language: str = "en",
+    device: str = "cpu",
+    fast_mode: bool | None = None,
+    nonspeech_skip: float | None = None,
+    demucs_shifts: int | None = None,
+    demucs_overlap: float | None = None,
+) -> tuple[float, list[tuple[str, float, float]]]:
+    """The GPU-heavy half of :func:`align`, isolated so it can run remotely.
+
+    Returns ``(duration_seconds, [(word, begin, end), ...])`` -- the raw
+    stable-ts word timings, before they're mapped back onto the lyric
+    structure (that mapping is cheap and stays on the caller). The ``fast_mode``
+    / ``nonspeech_skip`` (stable-ts) and ``demucs_shifts`` / ``demucs_overlap``
+    (Demucs) knobs fall back to env when left None (see ``_align_opts`` /
+    ``_demucs_opts``).
+    """
+    align_opts = _align_opts(fast_mode, nonspeech_skip)
+    dmx_opts = _demucs_opts(demucs_shifts, demucs_overlap)
+    with _stage("probe"):
+        dur = probe_duration(audio_path)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = str(Path(tmp) / "audio.wav")
+        with _stage("decode"):
+            _decode_wav(audio_path, wav)
+        if demucs:
+            with _stage("demucs_load"):  # ~0s warm; htdemucs weights on first job
+                _load_demucs("htdemucs")
+            with _stage("demucs"):
+                align_audio = _isolate_vocals(wav, tmp, device=device, **dmx_opts)
+        else:
+            align_audio = wav
+            _tlog("demucs        skipped")
+
+        with _stage("model_load"):   # ~0s on a warm cache; large on first job
+            model = _load_model(model_name, device=device)
+        with _stage("align"):
+            result = model.align(align_audio, alignment_text, language=language,
+                                 **align_opts)
+
+    if hasattr(result, "all_words"):
+        words = result.all_words()
+    else:
+        words = [w for seg in result.segments for w in seg.words]
+    return dur, [(w.word, float(w.start), float(w.end)) for w in words]
+
+
+# Where the GPU-heavy compute stage runs. LYRICSYNC_BACKEND picks one of
+# "local" (CPU, default), "modal", or "runpod".
+def _backend() -> str:
+    return os.environ.get("LYRICSYNC_BACKEND", "local").strip().lower() or "local"
+
+
+def _align_on_modal(
+    audio_path: str,
+    alignment_text: str,
+    *,
+    demucs: bool,
+    model_name: str,
+    language: str,
+) -> tuple[float, list[tuple[str, float, float]]]:
+    """Run :func:`_compute_alignment` on the deployed Modal GPU class."""
+    import modal
+
+    app_name = os.environ.get("LYRICSYNC_MODAL_APP", "lyricsync")
+    # 16 kHz mono Opus, same as the RunPod path: lossless vs the pipeline and a
+    # fraction of the upload (Modal has no hard body cap, just no reason to ship
+    # bytes the worker immediately downsamples away).
+    audio_bytes = _encode_align_audio(audio_path)
+    aligner = modal.Cls.from_name(app_name, "Aligner")()
+    res = aligner.transcribe_align.remote(
+        audio_bytes, ".opus", alignment_text, language, demucs, model_name)
+    return res["dur"], [tuple(x) for x in res["aligned"]]
+
+
+def _align_on_runpod(
+    audio_path: str,
+    alignment_text: str,
+    *,
+    demucs: bool,
+    model_name: str,
+    language: str,
+) -> tuple[float, list[tuple[str, float, float]]]:
+    """Run :func:`_compute_alignment` on a RunPod serverless endpoint.
+
+    Posts the audio (base64 in JSON, the only thing RunPod's queue accepts) to
+    ``/run`` and polls ``/status`` until the worker returns. Needs
+    ``RUNPOD_ENDPOINT_ID`` + ``RUNPOD_API_KEY``; see ``runpod_handler.py`` for
+    the matching worker side. Uses stdlib urllib so the API venv stays lean.
+    """
+    import base64
+    import json
+    import time as _time
+    import urllib.request
+
+    endpoint = os.environ["RUNPOD_ENDPOINT_ID"]
+    key = os.environ["RUNPOD_API_KEY"]
+    base = f"https://api.runpod.ai/v2/{endpoint}"
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+    def _call(path: str, body: dict | None = None, method: str = "POST") -> dict:
+        req = urllib.request.Request(
+            base + path,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read())
+
+    # Ship 16 kHz mono Opus, not the raw master: RunPod's /run body caps at
+    # 20 MB and a base64'd full track sails past it (-> 502 at the gateway).
+    payload = {"input": {
+        "audio_b64": base64.b64encode(_encode_align_audio(audio_path)).decode(),
+        "suffix": ".opus",
+        "alignment_text": alignment_text,
+        "language": language,
+        "demucs": demucs,
+        "model_name": model_name,
+    }}
+    job_id = _call("/run", payload)["id"]
+
+    deadline = _time.time() + 600
+    while _time.time() < deadline:
+        st = _call(f"/status/{job_id}", method="GET")
+        status = st.get("status")
+        if status == "COMPLETED":
+            out = st["output"]
+            return out["dur"], [tuple(x) for x in out["aligned"]]
+        if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+            raise RuntimeError(f"RunPod job {status}: {st.get('error') or st}")
+        _time.sleep(2)
+    raise TimeoutError(f"RunPod job {job_id} did not finish within 600s")
 
 
 # --------------------------------------------------------------------------- #
@@ -206,37 +414,25 @@ def align(
     language: str | None = None,
 ) -> AlignedLyrics:
     t_start = time.perf_counter()
-    with _stage("probe"):
-        dur = probe_duration(audio_path)
     lang = language or parsed.lang or "en"
 
-    with tempfile.TemporaryDirectory() as tmp:
-        wav = str(Path(tmp) / "audio.wav")
-        with _stage("decode"):
-            _decode_wav(audio_path, wav)
-        if demucs:
-            with _stage("demucs_load"):  # ~0s warm; htdemucs weights on first job
-                _load_demucs("htdemucs")
-            with _stage("demucs"):
-                align_audio = _isolate_vocals(wav, tmp)
-        else:
-            align_audio = wav
-            _tlog("demucs        skipped")
-
-        with _stage("model_load"):   # ~0s on a warm cache; large on first job
-            model = _load_model(model_name)
-        with _stage("align"):
-            result = model.align(align_audio, parsed.alignment_text,
-                                 language=lang)
+    backend = _backend()
+    if backend == "modal":
+        with _stage("modal"):    # GPU compute on Modal: decode + demucs + align
+            dur, aligned = _align_on_modal(
+                audio_path, parsed.alignment_text,
+                demucs=demucs, model_name=model_name, language=lang)
+    elif backend == "runpod":
+        with _stage("runpod"):   # GPU compute on a RunPod serverless endpoint
+            dur, aligned = _align_on_runpod(
+                audio_path, parsed.alignment_text,
+                demucs=demucs, model_name=model_name, language=lang)
+    else:
+        dur, aligned = _compute_alignment(
+            audio_path, parsed.alignment_text,
+            demucs=demucs, model_name=model_name, language=lang, device="cpu")
 
     with _stage("map+rebuild"):
-        # Flatten aligned words.
-        if hasattr(result, "all_words"):
-            words = result.all_words()
-        else:
-            words = [w for seg in result.segments for w in seg.words]
-        aligned = [(w.word, float(w.start), float(w.end)) for w in words]
-
         # Map onto our canonical lexical tokens.
         tokens = [w for ln in parsed.lines if not ln.is_nonlexical
                   for w in ln.words]

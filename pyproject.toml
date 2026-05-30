@@ -20,6 +20,9 @@ api = [
     "uvicorn[standard]>=0.29",
     "python-multipart>=0.0.9",
 ]
+modal = [
+    "modal>=1.0",
+]
 dev = [
     "pytest>=8.0",
 ]

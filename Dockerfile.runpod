@@ -1,0 +1,40 @@
+# LyricSync RunPod serverless worker — GPU compute (Demucs + faster-whisper).
+#
+# Same NVIDIA CUDA runtime base as the Modal image: it ships libcublas + cuDNN
+# on the loader path, which CTranslate2 (faster-whisper) needs and which a plain
+# python/debian image lacks. Build + push with scripts/build_runpod.sh.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1
+
+# ffmpeg: decode/probe. libsndfile1: soundfile (Demucs stem write). python3/pip
+# from the distro (Ubuntu 22.04 -> 3.10; align.py uses `from __future__ import
+# annotations`, so the `X | None` hints are fine).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg libsndfile1 python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --upgrade pip
+
+WORKDIR /app
+
+# torch built for CUDA 12.4 (matches the base image). NOT the default PyPI
+# wheel: that's now a CUDA 13 (+cu130) build, which RunPod's GPU driver (CUDA
+# 12.8) is too old to run -- "NVIDIA driver too old". A 12.8 driver runs cu124
+# fine. Install first so the project's torch pin resolves to this build.
+RUN pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# Core lyricsync deps (NOT the api extra -- no FastAPI needed in the worker)
+# plus the RunPod SDK. torch is already satisfied above.
+COPY pyproject.toml README.md ./
+COPY lyricsync ./lyricsync
+RUN pip install "." runpod
+
+COPY runpod_handler.py ./
+
+# Bake weights into the image so a cold worker doesn't download them.
+RUN python3 -c "from demucs.pretrained import get_model; get_model('htdemucs'); \
+import stable_whisper; stable_whisper.load_faster_whisper('small', device='cpu', compute_type='int8')"
+
+CMD ["python3", "-u", "runpod_handler.py"]

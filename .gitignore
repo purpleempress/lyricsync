@@ -6,5 +6,6 @@ __pycache__/
 *.egg-info/
 .cache/
 credentials.json
+.env
 # The Lucid fork is its own repo (purpleempress/lucid-lyrics), not vendored here.
 lucid-lyrics/

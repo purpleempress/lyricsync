@@ -1,0 +1,19 @@
+# Opt-in overlay that offloads Demucs + Whisper to a deployed Modal GPU.
+# Layer it on top of the base compose file:
+#
+#   docker compose -f compose.yaml -f compose.modal.yaml up -d --build
+#
+# Kept separate from compose.yaml on purpose: the base service stays a pure-CPU
+# deployment that needs no Modal account. Auth is via env (from .env), so this
+# overlay touches no filesystem -- symmetric with compose.runpod.yaml. Deploy the
+# GPU app first with: bash scripts/deploy_modal.sh
+services:
+  lyricsync:
+    environment:
+      LYRICSYNC_BACKEND: modal
+      LYRICSYNC_MODAL_APP: "${LYRICSYNC_MODAL_APP:-lyricsync}"
+      # Modal token, from .env. Get the values with `modal token new` (or copy
+      # token_id / token_secret out of ~/.modal.toml). The `:?` guards fail fast
+      # with a clear message if either is missing.
+      MODAL_TOKEN_ID: "${MODAL_TOKEN_ID:?set MODAL_TOKEN_ID}"
+      MODAL_TOKEN_SECRET: "${MODAL_TOKEN_SECRET:?set MODAL_TOKEN_SECRET}"

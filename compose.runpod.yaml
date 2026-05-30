@@ -1,0 +1,16 @@
+# Opt-in overlay that offloads Demucs + Whisper to a RunPod serverless endpoint.
+# Layer it on top of the base compose file:
+#
+#   RUNPOD_ENDPOINT_ID=... RUNPOD_API_KEY=... \
+#     docker compose -f compose.yaml -f compose.runpod.yaml up -d --build
+#
+# Like compose.modal.yaml, this keeps the base service a pure-CPU deployment.
+# RunPod auth is plain env vars (no file to mount), so the `:?` guards just make
+# compose fail fast with a clear message if either is missing. Build + register
+# the worker image first with: IMAGE=... bash scripts/build_runpod.sh
+services:
+  lyricsync:
+    environment:
+      LYRICSYNC_BACKEND: runpod
+      RUNPOD_ENDPOINT_ID: "${RUNPOD_ENDPOINT_ID:?set RUNPOD_ENDPOINT_ID}"
+      RUNPOD_API_KEY: "${RUNPOD_API_KEY:?set RUNPOD_API_KEY}"

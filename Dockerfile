@@ -15,11 +15,13 @@ RUN pip install --no-cache-dir \
       torch torchaudio
 
 # App + remaining deps (torch is already satisfied, so the project's torch pin
-# resolves to the CPU build installed above).
+# resolves to the CPU build installed above). The `modal` extra adds only the
+# client SDK (no CUDA) so the container can offload compute to a deployed Modal
+# GPU when LYRICSYNC_MODAL=1; the CPU torch above stays the local fallback.
 COPY pyproject.toml README.md ./
 COPY lyricsync ./lyricsync
 COPY api ./api
-RUN pip install --no-cache-dir ".[api]"
+RUN pip install --no-cache-dir ".[api,modal]"
 
 # Whisper/Demucs model weights and the sync cache all live under /app/.cache,
 # which compose mounts as a named volume so they survive restarts.
